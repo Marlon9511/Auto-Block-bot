@@ -39,9 +39,22 @@ const STARTUP_GRACE_MS = 15000;
 
 const logger = pino({ level: 'silent' }); // auf 'info' oder 'debug' stellen zum Fehlersuchen
 
-// Hält alle bekannten Kontakt-JIDs
+// Hält alle bekannten Kontakt-JIDs (in PN-Form, z.B. 49...@s.whatsapp.net)
 const knownContacts = new Set();
+
+// Zuordnung LID (@lid, Privatsphäre-JID) -> echte PN-JID (@s.whatsapp.net),
+// gelernt aus dem Kontakt-Sync
+const lidToPn = new Map();
+
 let startedAt = null;
+
+function registerContact(c) {
+  if (!c || !c.id) return;
+  knownContacts.add(c.id);
+  if (c.lid) {
+    lidToPn.set(c.lid, c.id);
+  }
+}
 
 async function startBot() {
   const { state, saveCreds } = await useMultiFileAuthState('auth_info');
@@ -106,20 +119,49 @@ async function startBot() {
   // --- Kontakte mitschneiden -------------------------------------------
   // Initialer Sync beim Login
   sock.ev.on('contacts.set', ({ contacts }) => {
-    for (const c of contacts) knownContacts.add(c.id);
-    console.log(`📇 ${knownContacts.size} Kontakte initial synchronisiert.`);
+    for (const c of contacts) registerContact(c);
+    console.log(`📇 ${knownContacts.size} Kontakte initial synchronisiert (davon ${lidToPn.size} mit LID-Zuordnung).`);
   });
 
   // Neue/aktualisierte Kontakte während der Laufzeit
   sock.ev.on('contacts.upsert', (contacts) => {
-    for (const c of contacts) knownContacts.add(c.id);
+    for (const c of contacts) registerContact(c);
   });
 
   sock.ev.on('contacts.update', (updates) => {
-    for (const u of updates) {
-      if (u.id) knownContacts.add(u.id);
-    }
+    for (const u of updates) registerContact(u);
   });
+
+  // Löst eine @lid-JID zur echten @s.whatsapp.net-JID auf. Nötig, weil
+  // updateBlockStatus() nur PN-JIDs akzeptiert und die Kontaktliste ebenfalls
+  // in PN-Form geführt wird.
+  async function resolveToPnJid(rawJid, altJid) {
+    if (!rawJid) return null;
+    if (!rawJid.endsWith('@lid')) {
+      return jidNormalizedUser(rawJid);
+    }
+
+    // 1) Baileys liefert bei LID-Chats oft direkt die Alt-JID (PN) mit
+    if (altJid && altJid.endsWith('@s.whatsapp.net')) {
+      return jidNormalizedUser(altJid);
+    }
+
+    // 2) Aus dem Kontakt-Sync gelernte Zuordnung
+    if (lidToPn.has(rawJid)) {
+      return jidNormalizedUser(lidToPn.get(rawJid));
+    }
+
+    // 3) Baileys' interner LID<->PN-Store (Signal-Repository), falls von
+    //    der installierten Version unterstützt
+    try {
+      const pn = await sock.signalRepository?.lidMapping?.getPNForLID?.(rawJid);
+      if (pn) return jidNormalizedUser(pn);
+    } catch (_) {
+      // ignorieren, Fallback unten greift
+    }
+
+    return null; // konnte nicht aufgelöst werden
+  }
 
   // --- Eingehende Nachrichten prüfen ------------------------------------
   sock.ev.on('messages.upsert', async ({ messages, type }) => {
@@ -142,19 +184,35 @@ async function startBot() {
         const isGroup = isJidGroup?.(jid) ?? jid.endsWith('@g.us');
         if (IGNORE_GROUPS && isGroup) continue;
 
-        // Bei Gruppen ist der eigentliche Absender in participant zu finden
+        // Bei Gruppen ist der eigentliche Absender in participant zu finden.
+        // "Alt"-Feld: Baileys liefert bei LID-Chats teils direkt die
+        // Gegenstück-JID mit (PN, falls remoteJid eine LID ist).
         const rawSenderJid = isGroup ? msg.key.participant : jid;
+        const altSenderJid = isGroup ? msg.key.participantAlt : msg.key.remoteJidAlt;
         if (!rawSenderJid) continue;
 
-        // Nur "normale" Nutzer-JIDs verarbeiten (kein @lid, keine Gruppe,
-        // kein Broadcast) – das war die Ursache des "bad-request"-Fehlers:
-        // updateBlockStatus akzeptiert nur reguläre @s.whatsapp.net-JIDs.
-        if (!isJidUser?.(rawSenderJid) && !rawSenderJid.endsWith('@s.whatsapp.net')) {
+        let senderJid;
+
+        if (rawSenderJid.endsWith('@lid')) {
+          // Privatsphäre-JID -> versuchen, die echte Nummer aufzulösen
+          const resolved = await resolveToPnJid(rawSenderJid, altSenderJid);
+          if (resolved) {
+            senderJid = resolved;
+            console.log(`🔗 LID ${rawSenderJid} aufgelöst zu ${senderJid}`);
+          } else {
+            // Konnte nicht aufgelöst werden: sicherheitshalber NICHT
+            // blockieren (könnte ein gespeicherter Kontakt mit LID sein,
+            // dessen Zuordnung wir noch nicht kennen), nur loggen.
+            console.log(`⚠️  Konnte LID nicht auflösen, überspringe sicherheitshalber: ${rawSenderJid}`);
+            continue;
+          }
+        } else if (isJidUser?.(rawSenderJid) || rawSenderJid.endsWith('@s.whatsapp.net')) {
+          senderJid = jidNormalizedUser(rawSenderJid);
+        } else {
+          // Nicht-blockierbare JID (z.B. exotischer Typ)
           console.log(`ℹ️  Überspringe nicht-blockierbare JID: ${rawSenderJid}`);
           continue;
         }
-
-        const senderJid = jidNormalizedUser(rawSenderJid);
 
         if (WHITELIST.includes(senderJid)) continue;
 
