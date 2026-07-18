@@ -3,6 +3,7 @@ const {
   useMultiFileAuthState,
   DisconnectReason,
   Browsers,
+  fetchLatestBaileysVersion,
 } = require('@whiskeysockets/baileys');
 const { Boom } = require('@hapi/boom');
 const qrcode = require('qrcode-terminal');
@@ -39,7 +40,15 @@ let startedAt = null;
 async function startBot() {
   const { state, saveCreds } = await useMultiFileAuthState('auth_info');
 
+  // Aktuelle WhatsApp-Web-Protokollversion holen. Das ist der häufigste
+  // Grund für sofortige Verbindungsabbrüche: Läuft Baileys mit einer
+  // veralteten/hart codierten Version, wirft WhatsApp die Verbindung
+  // sofort wieder raus.
+  const { version, isLatest } = await fetchLatestBaileysVersion();
+  console.log(`ℹ️  Nutze WA-Web-Version ${version.join('.')} (aktuellste: ${isLatest})`);
+
   const sock = makeWASocket({
+    version,
     auth: state,
     logger,
     browser: Browsers.macOS('Desktop'),
@@ -56,9 +65,29 @@ async function startBot() {
     }
 
     if (connection === 'close') {
-      const statusCode = new Boom(lastDisconnect?.error)?.output?.statusCode;
+      const boomError = new Boom(lastDisconnect?.error);
+      const statusCode = boomError?.output?.statusCode;
+      const reasonName = Object.keys(DisconnectReason).find(
+        (k) => DisconnectReason[k] === statusCode
+      ) || 'unbekannt';
+
+      console.warn(`⚠️  Verbindung getrennt. Status: ${statusCode} (${reasonName})`);
+      console.warn(`    Grund: ${boomError?.message}`);
+
       const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
-      console.warn('⚠️  Verbindung getrennt.', shouldReconnect ? 'Verbinde erneut ...' : 'Ausgeloggt, bitte erneut per QR-Code anmelden.');
+
+      if (statusCode === DisconnectReason.loggedOut) {
+        console.warn('    → Ausgeloggt. Lösche den Ordner "auth_info" und starte neu, um dich per QR-Code erneut anzumelden.');
+      } else if (statusCode === DisconnectReason.badSession) {
+        console.warn('    → Ungültige Session. Lösche den Ordner "auth_info" und starte neu.');
+      } else if (statusCode === DisconnectReason.connectionReplaced) {
+        console.warn('    → Verbindung wurde durch ein anderes verknüpftes Gerät ersetzt.');
+      } else if (statusCode === DisconnectReason.restartRequired) {
+        console.log('    → Neustart nach Erstverbindung erforderlich (normal), verbinde erneut ...');
+      } else {
+        console.warn('    → Verbinde erneut ...');
+      }
+
       if (shouldReconnect) startBot();
     } else if (connection === 'open') {
       startedAt = Date.now();
