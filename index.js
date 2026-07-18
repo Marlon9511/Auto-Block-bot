@@ -54,11 +54,17 @@ let startedAt = null;
 let reconnectAttempts = 0;
 const MAX_RECONNECT_DELAY_MS = 60000; // maximal 60 Sekunden zwischen Versuchen
 
+// Wird erst true, sobald wir sicher wissen, dass mindestens ein
+// Kontakt-Sync-Event mit Daten eingetroffen ist. Verhindert, dass vor
+// abgeschlossenem Sync fälschlich gespeicherte Kontakte blockiert werden.
+let contactsSynced = false;
+
 function registerContact(c) {
   if (!c || !c.id) return;
-  knownContacts.add(c.id);
+  const pnId = jidNormalizedUser(c.id);
+  knownContacts.add(pnId);
   if (c.lid) {
-    lidToPn.set(c.lid, c.id);
+    lidToPn.set(c.lid, pnId);
     knownContacts.add(c.lid); // Sicherheitsnetz, falls die LID direkt verglichen wird
   }
 }
@@ -133,17 +139,64 @@ async function startBot() {
   // Initialer Sync beim Login
   sock.ev.on('contacts.set', ({ contacts }) => {
     for (const c of contacts) registerContact(c);
-    console.log(`📇 ${knownContacts.size} Kontakte initial synchronisiert (davon ${lidToPn.size} mit LID-Zuordnung).`);
+    contactsSynced = true;
+    console.log('');
+    console.log('════════════════════════════════════════');
+    console.log(`📇 KONTAKTE SYNCHRONISIERT: ${knownContacts.size} Kontakte bekannt`);
+    console.log('════════════════════════════════════════');
+    console.log('');
   });
 
   // Neue/aktualisierte Kontakte während der Laufzeit
   sock.ev.on('contacts.upsert', (contacts) => {
     for (const c of contacts) registerContact(c);
+    if (contacts.length) {
+      console.log(`📇 ${contacts.length} neue(r) Kontakt(e) synchronisiert (gesamt: ${knownContacts.size}).`);
+      for (const c of contacts) {
+        console.log(`    + ${c.name || c.notify || c.id}`);
+      }
+    }
   });
 
   sock.ev.on('contacts.update', (updates) => {
     for (const u of updates) registerContact(u);
+    if (updates.length) {
+      console.log(`📇 ${updates.length} Kontakt(e) aktualisiert (gesamt: ${knownContacts.size}).`);
+    }
   });
+
+  // In neueren Baileys-Versionen kommt der initiale Kontakt-Sync teils
+  // NICHT über contacts.set, sondern über dieses History-Sync-Event.
+  // Ohne diesen Listener bleibt knownContacts leer und der Bot würde
+  // fälschlich auch gespeicherte Kontakte blockieren.
+  sock.ev.on('messaging-history.set', ({ contacts, isLatest, progress }) => {
+    if (Array.isArray(contacts) && contacts.length) {
+      for (const c of contacts) registerContact(c);
+      const wasAlreadySynced = contactsSynced;
+      contactsSynced = true;
+      if (!wasAlreadySynced) {
+        console.log('');
+        console.log('════════════════════════════════════════');
+        console.log(`📇 KONTAKTE SYNCHRONISIERT: ${knownContacts.size} Kontakte bekannt`);
+        console.log('════════════════════════════════════════');
+        console.log('');
+      } else {
+        console.log(`📇 History-Sync: ${knownContacts.size} Kontakte bekannt (isLatest: ${isLatest}, progress: ${progress}%).`);
+      }
+    }
+  });
+
+  // Diagnose: Warnen, falls nach der Startphase immer noch keine
+  // Kontakte bekannt sind – dann würde der Bot ALLES blockieren.
+  setTimeout(() => {
+    if (!contactsSynced) {
+      console.warn('⚠️  Achtung: Es wurde bisher KEIN Kontakt-Sync-Event empfangen.');
+      console.warn('    Der Bot blockiert deshalb sicherheitshalber vorerst NICHTS (siehe "Kontakt-Sync noch nicht bestätigt"-Logs).');
+      console.warn('    Falls das dauerhaft so bleibt, bitte den Log-Ausschnitt melden.');
+    } else {
+      console.log(`✅ Kontakt-Sync bestätigt: ${knownContacts.size} bekannte Kontakte.`);
+    }
+  }, STARTUP_GRACE_MS);
 
   // Löst eine @lid-JID zur echten @s.whatsapp.net-JID auf. Nötig, weil
   // updateBlockStatus() nur PN-JIDs akzeptiert und die Kontaktliste ebenfalls
@@ -234,6 +287,14 @@ async function startBot() {
         // Sicherheitsabstand nach dem Start, bis Kontakte synchronisiert sind
         if (!startedAt || Date.now() - startedAt < STARTUP_GRACE_MS) {
           console.log(`⏳ Ignoriere Nachricht während der Startphase von ${senderJid}`);
+          continue;
+        }
+
+        // Zusätzliches Sicherheitsgate: Ohne bestätigten Kontakt-Sync lieber
+        // NICHTS blockieren, statt versehentlich gespeicherte Kontakte zu
+        // erwischen.
+        if (!contactsSynced) {
+          console.log(`⏳ Kontakt-Sync noch nicht bestätigt, blockiere sicherheitshalber nicht: ${senderJid}`);
           continue;
         }
 
