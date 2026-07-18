@@ -4,6 +4,12 @@ const {
   DisconnectReason,
   Browsers,
   fetchLatestBaileysVersion,
+  jidNormalizedUser,
+  isJidUser,
+  isJidGroup,
+  isJidBroadcast,
+  isJidStatusBroadcast,
+  isJidNewsletter,
 } = require('@whiskeysockets/baileys');
 const { Boom } = require('@hapi/boom');
 const qrcode = require('qrcode-terminal');
@@ -127,14 +133,28 @@ async function startBot() {
         const jid = msg.key.remoteJid;
         if (!jid) continue;
 
-        const isGroup = jid.endsWith('@g.us');
-        const isStatus = jid === 'status@broadcast';
-        if (isStatus) continue;
+        // Nachrichtentypen ausschließen, die man nicht (sinnvoll) blockieren
+        // kann: Status-Updates, Broadcast-Listen, Newsletter/Kanäle.
+        if (isJidStatusBroadcast?.(jid) || jid === 'status@broadcast') continue;
+        if (isJidBroadcast?.(jid)) continue;
+        if (isJidNewsletter?.(jid) || jid.endsWith('@newsletter')) continue;
+
+        const isGroup = isJidGroup?.(jid) ?? jid.endsWith('@g.us');
         if (IGNORE_GROUPS && isGroup) continue;
 
         // Bei Gruppen ist der eigentliche Absender in participant zu finden
-        const senderJid = isGroup ? msg.key.participant : jid;
-        if (!senderJid) continue;
+        const rawSenderJid = isGroup ? msg.key.participant : jid;
+        if (!rawSenderJid) continue;
+
+        // Nur "normale" Nutzer-JIDs verarbeiten (kein @lid, keine Gruppe,
+        // kein Broadcast) – das war die Ursache des "bad-request"-Fehlers:
+        // updateBlockStatus akzeptiert nur reguläre @s.whatsapp.net-JIDs.
+        if (!isJidUser?.(rawSenderJid) && !rawSenderJid.endsWith('@s.whatsapp.net')) {
+          console.log(`ℹ️  Überspringe nicht-blockierbare JID: ${rawSenderJid}`);
+          continue;
+        }
+
+        const senderJid = jidNormalizedUser(rawSenderJid);
 
         if (WHITELIST.includes(senderJid)) continue;
 
@@ -152,8 +172,12 @@ async function startBot() {
             continue;
           }
 
-          await sock.updateBlockStatus(senderJid, 'block');
-          console.log(`🚫 Blockiert: ${senderJid}`);
+          try {
+            await sock.updateBlockStatus(senderJid, 'block');
+            console.log(`🚫 Blockiert: ${senderJid}`);
+          } catch (blockErr) {
+            console.error(`❌ Blockieren von ${senderJid} fehlgeschlagen:`, blockErr?.message || blockErr);
+          }
         }
       } catch (err) {
         console.error('Fehler bei der Verarbeitung einer Nachricht:', err);
