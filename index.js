@@ -107,10 +107,6 @@ async function startBot() {
     logger,
     browser: Browsers.macOS('Desktop'),
     printQRInTerminal: false, // wir rendern den QR-Code selbst
-    // Erzwingt einen vollständigen History-/App-State-Sync (inkl. Kontakte)
-    // auch bei einer bereits bestehenden Session. Ohne dies schickt WhatsApp
-    // den vollen Kontakt-Sync oft nur einmalig beim allerersten Pairing.
-    syncFullHistory: true,
   });
 
   // --- Verbindung & QR-Code -------------------------------------------
