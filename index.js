@@ -32,8 +32,9 @@ const IGNORE_GROUPS = true;
 
 // Wie lange nach dem Start gewartet wird, bevor überhaupt geprüft/blockiert
 // wird. Verhindert Fehlblockierungen, solange die Kontaktliste noch nicht
-// vollständig synchronisiert ist.
-const STARTUP_GRACE_MS = 15000;
+// vollständig synchronisiert ist. Ein vollständiger History-Sync kann
+// gerade beim ersten Mal mit syncFullHistory eine Weile dauern.
+const STARTUP_GRACE_MS = 30000;
 
 // ---------------------------------------------------------------------
 
@@ -106,6 +107,10 @@ async function startBot() {
     logger,
     browser: Browsers.macOS('Desktop'),
     printQRInTerminal: false, // wir rendern den QR-Code selbst
+    // Erzwingt einen vollständigen History-/App-State-Sync (inkl. Kontakte)
+    // auch bei einer bereits bestehenden Session. Ohne dies schickt WhatsApp
+    // den vollen Kontakt-Sync oft nur einmalig beim allerersten Pairing.
+    syncFullHistory: true,
   });
 
   // --- Verbindung & QR-Code -------------------------------------------
@@ -218,6 +223,15 @@ async function startBot() {
       console.log(`✅ Kontakt-Sync bestätigt: ${knownContacts.size} bekannte Kontakte.`);
     }
   }, STARTUP_GRACE_MS);
+
+  // Zweite, spätere Prüfung: Falls syncFullHistory sehr lange braucht.
+  setTimeout(() => {
+    if (!contactsSynced) {
+      console.warn('⚠️  Immer noch kein Kontakt-Sync nach 90 Sekunden.');
+      console.warn('    Möglicher nächster Schritt: "auth_info"-Ordner löschen und per QR-Code neu verbinden,');
+      console.warn('    damit WhatsApp einen frischen vollständigen Sync sendet.');
+    }
+  }, 90000);
 
   // Löst eine @lid-JID zur echten @s.whatsapp.net-JID auf. Nötig, weil
   // updateBlockStatus() nur PN-JIDs akzeptiert und die Kontaktliste ebenfalls
