@@ -14,6 +14,10 @@ const {
 const { Boom } = require('@hapi/boom');
 const qrcode = require('qrcode-terminal');
 const pino = require('pino');
+const fs = require('fs');
+const path = require('path');
+
+const CACHE_FILE = path.join(__dirname, 'known_contacts_cache.json');
 
 // ---- Konfiguration -------------------------------------------------
 
@@ -21,7 +25,11 @@ const pino = require('pino');
 // false = nur simulieren (Dry-Run), zeigt im Log an, wen er blockieren WÜRDE
 const DRY_RUN = false;
 
-// Nummern, die NIE blockiert werden sollen (Format: "49XXXXXXXXXX@s.whatsapp.net")
+// Nummern, die NIE blockiert werden sollen (Format: "49XXXXXXXXXX@s.whatsapp.net").
+// WICHTIG: Da der automatische Adressbuch-Sync nicht bei jedem Setup
+// zuverlässig funktioniert, ist dies der sicherste Schutz für echte
+// Kontakte. Trage hier am besten Familie/Freunde manuell ein, bevor du
+// DRY_RUN auf false stellst.
 const WHITELIST = [
   // "49123456789@s.whatsapp.net",
 ];
@@ -63,33 +71,60 @@ let contactsSynced = false;
 function registerContact(c) {
   if (!c || !c.id) return;
 
-  // TEMPORÄRES DEBUGGING: zeigt die rohen Felder, die WhatsApp für diesen
-  // Kontakt schickt. Damit lässt sich prüfen, ob "name" überhaupt jemals
-  // gefüllt ist (Adressbuch-Sync) oder ob nur "notify"/"verifiedName"
-  // (selbstgewählter Name) ankommt.
-  console.log('   [DEBUG] Rohkontakt:', JSON.stringify({
-    id: c.id,
-    lid: c.lid,
-    name: c.name,
-    notify: c.notify,
-    verifiedName: c.verifiedName,
-  }));
-
-  // WICHTIG: Baileys liefert im Kontakt-Sync JEDEN, mit dem du je
-  // geschrieben hast – nicht nur echte Adressbuch-Kontakte. Das "name"-Feld
-  // ist NUR gesetzt, wenn DU die Nummer in deinem Telefon-Adressbuch
-  // gespeichert hast. "notify"/"verifiedName" ist der selbstgewählte Name
-  // der Person und sagt nichts darüber aus, ob sie gespeichert ist.
   const isSavedInAddressBook = Boolean(c.name && c.name.trim().length > 0);
   if (!isSavedInAddressBook) return;
 
   const pnId = jidNormalizedUser(c.id);
+  const isNew = !knownContacts.has(pnId);
   knownContacts.add(pnId);
   if (c.lid) {
     lidToPn.set(c.lid, pnId);
     knownContacts.add(c.lid); // Sicherheitsnetz, falls die LID direkt verglichen wird
   }
+  if (isNew) {
+    console.log(`    + Adressbuch-Kontakt erkannt: ${c.name} (${pnId})`);
+    saveCache();
+  }
 }
+
+// --- Persistenter Cache -----------------------------------------------
+// Da der volle Kontakt-Sync bei manchen Setups nicht zuverlässig bei jedem
+// Start ankommt, wird jeder einmal erkannte Adressbuch-Kontakt dauerhaft
+// gespeichert. So geht das Wissen nicht bei jedem Neustart verloren.
+function loadCache() {
+  try {
+    const raw = fs.readFileSync(CACHE_FILE, 'utf8');
+    const data = JSON.parse(raw);
+    if (Array.isArray(data.knownContacts)) {
+      for (const jid of data.knownContacts) knownContacts.add(jid);
+    }
+    if (Array.isArray(data.lidToPn)) {
+      for (const [lid, pn] of data.lidToPn) lidToPn.set(lid, pn);
+    }
+    if (knownContacts.size > 0) {
+      console.log(`💾 ${knownContacts.size} bekannte Kontakte aus vorherigen Sessions geladen.`);
+    }
+  } catch (err) {
+    // Datei existiert noch nicht (erster Start) – kein Problem
+  }
+}
+
+function saveCache() {
+  try {
+    fs.writeFileSync(
+      CACHE_FILE,
+      JSON.stringify(
+        { knownContacts: [...knownContacts], lidToPn: [...lidToPn.entries()] },
+        null,
+        2
+      )
+    );
+  } catch (err) {
+    console.error('Fehler beim Speichern des Kontakt-Caches:', err.message);
+  }
+}
+
+loadCache();
 
 async function startBot() {
   const { state, saveCreds } = await useMultiFileAuthState('auth_info');
@@ -212,20 +247,20 @@ async function startBot() {
   // Kontakte bekannt sind – dann würde der Bot ALLES blockieren.
   setTimeout(() => {
     if (!contactsSynced) {
-      console.warn('⚠️  Achtung: Es wurde bisher KEIN Kontakt-Sync-Event empfangen.');
-      console.warn('    Der Bot blockiert deshalb sicherheitshalber vorerst NICHTS (siehe "Kontakt-Sync noch nicht bestätigt"-Logs).');
-      console.warn('    Falls das dauerhaft so bleibt, bitte den Log-Ausschnitt melden.');
+      console.warn('⚠️  Hinweis: Bisher kein vollständiges Kontakt-Sync-Event empfangen.');
+      console.warn(`    Bekannt sind aktuell nur ${knownContacts.size} Kontakte (aus Cache/Einzel-Updates).`);
+      console.warn('    WICHTIG: Trage sicherheitshalber echte Kontakte manuell in WHITELIST ein,');
+      console.warn('    solange der automatische Sync bei dir nicht zuverlässig läuft!');
     } else {
       console.log(`✅ Kontakt-Sync bestätigt: ${knownContacts.size} bekannte Kontakte.`);
     }
   }, STARTUP_GRACE_MS);
 
-  // Zweite, spätere Prüfung: Falls syncFullHistory sehr lange braucht.
+  // Zweite, spätere Prüfung für den Fall eines langsamen Syncs.
   setTimeout(() => {
     if (!contactsSynced) {
-      console.warn('⚠️  Immer noch kein Kontakt-Sync nach 90 Sekunden.');
-      console.warn('    Möglicher nächster Schritt: "auth_info"-Ordner löschen und per QR-Code neu verbinden,');
-      console.warn('    damit WhatsApp einen frischen vollständigen Sync sendet.');
+      console.warn(`⚠️  Immer noch kein vollständiger Kontakt-Sync nach 90 Sekunden (${knownContacts.size} Kontakte bekannt).`);
+      console.warn('    Der Bot blockiert trotzdem weiter (siehe WHITELIST für Schutz echter Kontakte).');
     }
   }, 90000);
 
@@ -318,14 +353,6 @@ async function startBot() {
         // Sicherheitsabstand nach dem Start, bis Kontakte synchronisiert sind
         if (!startedAt || Date.now() - startedAt < STARTUP_GRACE_MS) {
           console.log(`⏳ Ignoriere Nachricht während der Startphase von ${senderJid}`);
-          continue;
-        }
-
-        // Zusätzliches Sicherheitsgate: Ohne bestätigten Kontakt-Sync lieber
-        // NICHTS blockieren, statt versehentlich gespeicherte Kontakte zu
-        // erwischen.
-        if (!contactsSynced) {
-          console.log(`⏳ Kontakt-Sync noch nicht bestätigt, blockiere sicherheitshalber nicht: ${senderJid}`);
           continue;
         }
 
