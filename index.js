@@ -1,5 +1,12 @@
-const { Client, LocalAuth } = require('whatsapp-web.js');
+const {
+  default: makeWASocket,
+  useMultiFileAuthState,
+  DisconnectReason,
+  Browsers,
+} = require('@whiskeysockets/baileys');
+const { Boom } = require('@hapi/boom');
 const qrcode = require('qrcode-terminal');
+const pino = require('pino');
 
 // ---- Konfiguration -------------------------------------------------
 
@@ -7,73 +14,123 @@ const qrcode = require('qrcode-terminal');
 // false = nur simulieren (Dry-Run), zeigt im Log an, wen er blockieren WÜRDE
 const DRY_RUN = false;
 
-// Nummern, die NIE blockiert werden sollen (Format: "49XXXXXXXXXX@c.us")
+// Nummern, die NIE blockiert werden sollen (Format: "49XXXXXXXXXX@s.whatsapp.net")
 const WHITELIST = [
-  // "49123456789@c.us",
+  // "49123456789@s.whatsapp.net",
 ];
 
 // Gruppen-Nachrichten ignorieren (empfohlen, sonst würden auch
 // Gruppenmitglieder ohne Kontakteintrag blockiert)
 const IGNORE_GROUPS = true;
 
+// Wie lange nach dem Start gewartet wird, bevor überhaupt geprüft/blockiert
+// wird. Verhindert Fehlblockierungen, solange die Kontaktliste noch nicht
+// vollständig synchronisiert ist.
+const STARTUP_GRACE_MS = 15000;
+
 // ---------------------------------------------------------------------
 
-const client = new Client({
-  authStrategy: new LocalAuth(), // speichert die Session lokal, kein erneuter QR-Scan nötig
-  puppeteer: {
-    headless: true,
-    args: ['--no-sandbox', '--disable-setuid-sandbox'],
-  },
-});
+const logger = pino({ level: 'silent' }); // auf 'info' oder 'debug' stellen zum Fehlersuchen
 
-client.on('qr', (qr) => {
-  console.log('Scanne diesen QR-Code mit WhatsApp (Einstellungen > Verknüpfte Geräte):');
-  qrcode.generate(qr, { small: true });
-});
+// Hält alle bekannten Kontakt-JIDs
+const knownContacts = new Set();
+let startedAt = null;
 
-client.on('ready', () => {
-  console.log('✅ Bot ist verbunden und läuft. Wartet auf Nachrichten ...');
-});
+async function startBot() {
+  const { state, saveCreds } = await useMultiFileAuthState('auth_info');
 
-client.on('auth_failure', (msg) => {
-  console.error('❌ Authentifizierung fehlgeschlagen:', msg);
-});
+  const sock = makeWASocket({
+    auth: state,
+    logger,
+    browser: Browsers.macOS('Desktop'),
+    printQRInTerminal: false, // wir rendern den QR-Code selbst
+  });
 
-client.on('disconnected', (reason) => {
-  console.warn('⚠️  Verbindung getrennt:', reason);
-});
+  // --- Verbindung & QR-Code -------------------------------------------
+  sock.ev.on('connection.update', (update) => {
+    const { connection, lastDisconnect, qr } = update;
 
-client.on('message', async (msg) => {
-  try {
-    const chat = await msg.getChat();
-
-    // Gruppen ggf. ignorieren
-    if (IGNORE_GROUPS && chat.isGroup) return;
-
-    const contact = await msg.getContact();
-    const senderId = contact.id._serialized;
-
-    // Whitelist prüfen
-    if (WHITELIST.includes(senderId)) return;
-
-    // isMyContact = true, wenn die Nummer im synchronisierten
-    // Adressbuch/Kontakte gespeichert ist
-    const isKnownContact = contact.isMyContact;
-
-    if (!isKnownContact) {
-      const name = contact.pushname || contact.number || senderId;
-
-      if (DRY_RUN) {
-        console.log(`[DRY RUN] Würde blockieren: ${name} (${senderId})`);
-        return;
-      }
-
-      await contact.block();
-      console.log(`🚫 Blockiert: ${name} (${senderId})`);
+    if (qr) {
+      console.log('Scanne diesen QR-Code mit WhatsApp (Einstellungen > Verknüpfte Geräte):');
+      qrcode.generate(qr, { small: true });
     }
-  } catch (err) {
-    console.error('Fehler bei der Verarbeitung einer Nachricht:', err);
-  }
-});
 
-client.initialize();
+    if (connection === 'close') {
+      const statusCode = new Boom(lastDisconnect?.error)?.output?.statusCode;
+      const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
+      console.warn('⚠️  Verbindung getrennt.', shouldReconnect ? 'Verbinde erneut ...' : 'Ausgeloggt, bitte erneut per QR-Code anmelden.');
+      if (shouldReconnect) startBot();
+    } else if (connection === 'open') {
+      startedAt = Date.now();
+      console.log('✅ Bot ist verbunden und läuft. Synchronisiere Kontakte ...');
+    }
+  });
+
+  sock.ev.on('creds.update', saveCreds);
+
+  // --- Kontakte mitschneiden -------------------------------------------
+  // Initialer Sync beim Login
+  sock.ev.on('contacts.set', ({ contacts }) => {
+    for (const c of contacts) knownContacts.add(c.id);
+    console.log(`📇 ${knownContacts.size} Kontakte initial synchronisiert.`);
+  });
+
+  // Neue/aktualisierte Kontakte während der Laufzeit
+  sock.ev.on('contacts.upsert', (contacts) => {
+    for (const c of contacts) knownContacts.add(c.id);
+  });
+
+  sock.ev.on('contacts.update', (updates) => {
+    for (const u of updates) {
+      if (u.id) knownContacts.add(u.id);
+    }
+  });
+
+  // --- Eingehende Nachrichten prüfen ------------------------------------
+  sock.ev.on('messages.upsert', async ({ messages, type }) => {
+    if (type !== 'notify') return;
+
+    for (const msg of messages) {
+      try {
+        if (!msg.message) continue;
+        if (msg.key.fromMe) continue;
+
+        const jid = msg.key.remoteJid;
+        if (!jid) continue;
+
+        const isGroup = jid.endsWith('@g.us');
+        const isStatus = jid === 'status@broadcast';
+        if (isStatus) continue;
+        if (IGNORE_GROUPS && isGroup) continue;
+
+        // Bei Gruppen ist der eigentliche Absender in participant zu finden
+        const senderJid = isGroup ? msg.key.participant : jid;
+        if (!senderJid) continue;
+
+        if (WHITELIST.includes(senderJid)) continue;
+
+        // Sicherheitsabstand nach dem Start, bis Kontakte synchronisiert sind
+        if (!startedAt || Date.now() - startedAt < STARTUP_GRACE_MS) {
+          console.log(`⏳ Ignoriere Nachricht während der Startphase von ${senderJid}`);
+          continue;
+        }
+
+        const isKnownContact = knownContacts.has(senderJid);
+
+        if (!isKnownContact) {
+          if (DRY_RUN) {
+            console.log(`[DRY RUN] Würde blockieren: ${senderJid}`);
+            continue;
+          }
+
+          await sock.updateBlockStatus(senderJid, 'block');
+          console.log(`🚫 Blockiert: ${senderJid}`);
+        }
+      } catch (err) {
+        console.error('Fehler bei der Verarbeitung einer Nachricht:', err);
+      }
+    }
+  });
+}
+
+startBot();
