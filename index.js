@@ -62,6 +62,18 @@ let contactsSynced = false;
 function registerContact(c) {
   if (!c || !c.id) return;
 
+  // TEMPORÄRES DEBUGGING: zeigt die rohen Felder, die WhatsApp für diesen
+  // Kontakt schickt. Damit lässt sich prüfen, ob "name" überhaupt jemals
+  // gefüllt ist (Adressbuch-Sync) oder ob nur "notify"/"verifiedName"
+  // (selbstgewählter Name) ankommt.
+  console.log('   [DEBUG] Rohkontakt:', JSON.stringify({
+    id: c.id,
+    lid: c.lid,
+    name: c.name,
+    notify: c.notify,
+    verifiedName: c.verifiedName,
+  }));
+
   // WICHTIG: Baileys liefert im Kontakt-Sync JEDEN, mit dem du je
   // geschrieben hast – nicht nur echte Adressbuch-Kontakte. Das "name"-Feld
   // ist NUR gesetzt, wenn DU die Nummer in deinem Telefon-Adressbuch
