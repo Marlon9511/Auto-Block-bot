@@ -48,11 +48,18 @@ const lidToPn = new Map();
 
 let startedAt = null;
 
+// Backoff für Reconnects: verhindert, dass sich der Bot bei instabiler
+// Verbindung (z.B. Termux im Hintergrund) in eine schnelle Trennungs-
+// Schleife hochschaukelt.
+let reconnectAttempts = 0;
+const MAX_RECONNECT_DELAY_MS = 60000; // maximal 60 Sekunden zwischen Versuchen
+
 function registerContact(c) {
   if (!c || !c.id) return;
   knownContacts.add(c.id);
   if (c.lid) {
     lidToPn.set(c.lid, c.id);
+    knownContacts.add(c.lid); // Sicherheitsnetz, falls die LID direkt verglichen wird
   }
 }
 
@@ -107,8 +114,14 @@ async function startBot() {
         console.warn('    → Verbinde erneut ...');
       }
 
-      if (shouldReconnect) startBot();
+      if (shouldReconnect) {
+        reconnectAttempts += 1;
+        const delay = Math.min(2000 * 2 ** (reconnectAttempts - 1), MAX_RECONNECT_DELAY_MS);
+        console.log(`    Warte ${Math.round(delay / 1000)}s vor erneutem Verbindungsversuch (Versuch ${reconnectAttempts}) ...`);
+        setTimeout(startBot, delay);
+      }
     } else if (connection === 'open') {
+      reconnectAttempts = 0; // Zähler nach erfolgreicher Verbindung zurücksetzen
       startedAt = Date.now();
       console.log('✅ Bot ist verbunden und läuft. Synchronisiere Kontakte ...');
     }
@@ -200,11 +213,13 @@ async function startBot() {
             senderJid = resolved;
             console.log(`🔗 LID ${rawSenderJid} aufgelöst zu ${senderJid}`);
           } else {
-            // Konnte nicht aufgelöst werden: sicherheitshalber NICHT
-            // blockieren (könnte ein gespeicherter Kontakt mit LID sein,
-            // dessen Zuordnung wir noch nicht kennen), nur loggen.
-            console.log(`⚠️  Konnte LID nicht auflösen, überspringe sicherheitshalber: ${rawSenderJid}`);
-            continue;
+            // Konnte nicht aufgelöst werden. Das passiert praktisch immer
+            // bei WIRKLICH unbekannten Absendern, da eine Zuordnung nur
+            // für bereits gespeicherte Kontakte existiert. Statt komplett
+            // zu überspringen, wird daher direkt mit der LID selbst
+            // blockiert (WhatsApp akzeptiert LID-JIDs für den Block-Call).
+            console.log(`⚠️  Konnte LID nicht auflösen (vermutlich kein gespeicherter Kontakt): ${rawSenderJid}`);
+            senderJid = jidNormalizedUser(rawSenderJid);
           }
         } else if (isJidUser?.(rawSenderJid) || rawSenderJid.endsWith('@s.whatsapp.net')) {
           senderJid = jidNormalizedUser(rawSenderJid);
