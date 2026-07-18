@@ -61,6 +61,15 @@ let contactsSynced = false;
 
 function registerContact(c) {
   if (!c || !c.id) return;
+
+  // WICHTIG: Baileys liefert im Kontakt-Sync JEDEN, mit dem du je
+  // geschrieben hast – nicht nur echte Adressbuch-Kontakte. Das "name"-Feld
+  // ist NUR gesetzt, wenn DU die Nummer in deinem Telefon-Adressbuch
+  // gespeichert hast. "notify"/"verifiedName" ist der selbstgewählte Name
+  // der Person und sagt nichts darüber aus, ob sie gespeichert ist.
+  const isSavedInAddressBook = Boolean(c.name && c.name.trim().length > 0);
+  if (!isSavedInAddressBook) return;
+
   const pnId = jidNormalizedUser(c.id);
   knownContacts.add(pnId);
   if (c.lid) {
@@ -300,18 +309,21 @@ async function startBot() {
 
         const isKnownContact = knownContacts.has(senderJid);
 
-        if (!isKnownContact) {
-          if (DRY_RUN) {
-            console.log(`[DRY RUN] Würde blockieren: ${senderJid}`);
-            continue;
-          }
+        if (isKnownContact) {
+          console.log(`✅ Bekannter Kontakt, wird nicht blockiert: ${senderJid}`);
+          continue;
+        }
 
-          try {
-            await sock.updateBlockStatus(senderJid, 'block');
-            console.log(`🚫 Blockiert: ${senderJid}`);
-          } catch (blockErr) {
-            console.error(`❌ Blockieren von ${senderJid} fehlgeschlagen:`, blockErr?.message || blockErr);
-          }
+        if (DRY_RUN) {
+          console.log(`[DRY RUN] Würde blockieren: ${senderJid}`);
+          continue;
+        }
+
+        try {
+          await sock.updateBlockStatus(senderJid, 'block');
+          console.log(`🚫 Blockiert: ${senderJid}`);
+        } catch (blockErr) {
+          console.error(`❌ Blockieren von ${senderJid} fehlgeschlagen:`, blockErr?.message || blockErr);
         }
       } catch (err) {
         console.error('Fehler bei der Verarbeitung einer Nachricht:', err);
