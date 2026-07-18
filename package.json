@@ -1,0 +1,14 @@
+{
+  "name": "wa-auto-blocker",
+  "version": "1.0.0",
+  "description": "Blockiert automatisch WhatsApp-Nachrichten von Absendern, die nicht in den eigenen Kontakten gespeichert sind",
+  "main": "index.js",
+  "type": "commonjs",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "whatsapp-web.js": "^1.26.0",
+    "qrcode-terminal": "^0.12.0"
+  }
+}
